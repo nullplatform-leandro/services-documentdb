@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+#
+# documentdb-cluster service worker image — built on the lean gRPC worker bridge.
+# The bridge dials over gRPC and runs the bash entrypoint on each package-exec
+# action; this image adds the tooling the documentdb-cluster steps need and bakes the
+# service in, so the channel needs no cmdline.
+#
+# One image per package: NP_PACKAGE_NAME takes a single value, so the two
+# services in this repo ship as two images built from the same context.
+FROM public.ecr.aws/nullplatform/scopes/worker-bridge:1.0.0
+
+# Tooling the workflows call (the bridge base stays minimal on purpose):
+# aws + gomplate from apk. bash, jq, np, base64 and curl ship in the base.
+RUN apk add --no-cache aws-cli gomplate
+
+# OpenTofu >= 1.10 — the service inits its S3 backend with use_lockfile=true,
+# which needs tofu 1.10+. alpine only packages 1.7.x, so pull the official
+# static binary for the build arch.
+ARG TOFU_VERSION=1.12.6
+ARG TARGETARCH
+RUN curl -fsSL "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_${TARGETARCH}.tar.gz" \
+      | tar -xz -C /usr/local/bin tofu \
+    && tofu version
+
+# mongosh — how every user and database in this service is actually provisioned.
+#
+# It is installed from npm rather than apk or MongoDB's own tarball, and that is
+# forced, not a preference: there is no mongosh package in Alpine, and MongoDB
+# publishes only glibc builds (deb/rpm/tgz), none of which run on this musl
+# base. The npm package is plain JavaScript on top of node, so it is the only
+# form that works here without a glibc shim.
+#
+# The override is not optional either. mongosh pulls @mongodb-js/oidc-plugin
+# transitively, and its 2.x line requires node >= 20.19.2 AND is ESM-only —
+# while this base ships node 20.15.1, where `require()` of an ESM module is a
+# hard error. Alpine 3.20 has nothing newer that helps (nodejs-current is
+# 21.7.3, which predates the require(esm) backport). Pinning only the mongosh
+# version does not hold, because `npm install -g` resolves transitives fresh on
+# every build and drifts back to 2.x. Pinning the transitive dependency is what
+# actually makes the build reproducible.
+#
+# Verified: mongosh 2.3.8 + oidc-plugin 1.1.8 runs on node 20.15.1.
+ARG MONGOSH_VERSION=2.3.8
+ARG OIDC_PLUGIN_VERSION=1.1.8
+RUN apk add --no-cache nodejs npm \
+    && mkdir -p /opt/mongosh \
+    && printf '{"name":"np-mongosh","private":true,"dependencies":{"mongosh":"%s"},"overrides":{"@mongodb-js/oidc-plugin":"%s"}}' \
+         "${MONGOSH_VERSION}" "${OIDC_PLUGIN_VERSION}" > /opt/mongosh/package.json \
+    && cd /opt/mongosh \
+    && npm install --omit=dev --no-audit --no-fund \
+    && ln -sf /opt/mongosh/node_modules/.bin/mongosh /usr/local/bin/mongosh \
+    && npm cache clean --force \
+    && mongosh --version
+
+# Bake the service in and point the bridge at its entrypoint + service path.
+COPY . /app/pkg
+ENV NP_PACKAGE_NAME=documentdb-cluster \
+    NP_SERVICE_PATH=/app/pkg/documentdb-cluster \
+    NP_SCOPE_ENTRYPOINT=/app/pkg/documentdb-cluster/entrypoint/entrypoint

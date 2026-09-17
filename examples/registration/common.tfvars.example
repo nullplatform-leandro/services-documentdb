@@ -1,0 +1,30 @@
+# Copy to common.tfvars and fill in. Both layers read it:
+#   cd nullplatform            && tofu apply -var-file=../common.tfvars
+#   cd ../nullplatform-bindings && tofu apply -var-file=../common.tfvars
+#
+# np_api_key is deliberately NOT here. Export it instead:
+#   export TF_VAR_np_api_key="<key>"
+# .gitignore blocks *.tfvars and *.auto.tfvars precisely because tofu loads
+# the latter automatically and silently.
+
+nrn = "organization=<org-id>:account=<account-id>"
+
+# Must be a TAG of this repository, not a branch — the module rejects branches.
+service_repository_ref = "v0.1.0"
+
+# While the repository is private the module cannot fetch the specs without a
+# fine-grained token carrying Contents: Read-only. Pass it by environment
+# instead of writing it here: export TF_VAR_service_repository_token="<token>"
+
+# Digests from the release, as sha256:<64 hex>.
+cluster_image_digest  = "sha256:..."
+database_image_digest = "sha256:..."
+
+# Bump on every release. A new digest under an unchanged version publishes
+# nothing new to running services.
+package_version = "0.1.0"
+
+# The agent must run with the matching flag: -tags "owner:lean"
+tags_selectors = {
+  owner = "lean"
+}

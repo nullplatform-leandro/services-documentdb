@@ -1,0 +1,185 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# build_context — Extracts variables from the NP notification context and
+# prepares the Terraform execution environment for service actions.
+#
+# For link actions it also exports the LINK_* variables that
+# build_permissions_context consumes in the next workflow step.
+# ---------------------------------------------------------------------------
+
+# --- Parse service context --------------------------------------------------
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+SERVICE_NAME=$(echo "$CONTEXT" | jq -r '.service.name // ""')
+
+# Fall back to the service ID when the name is absent or sanitises to nothing.
+# Without this a service named e.g. "!!!" produces an empty identifier and the
+# AWS call fails with a message that points nowhere near the real cause.
+SERVICE_NAME="${SERVICE_NAME:-svc-${SERVICE_ID}}"
+
+# DocumentDB cluster identifiers: start with a letter, lowercase alphanumerics
+# and hyphens only, no two consecutive hyphens, no trailing hyphen, <= 63 chars.
+# Instance identifiers append "-<index>", so cap the base at 55.
+SANITIZED=$(echo "$SERVICE_NAME" \
+  | tr '[:upper:]' '[:lower:]' \
+  | tr -cs 'a-z0-9' '-' \
+  | sed 's/--*/-/g; s/^-*//; s/-*$//' \
+  | cut -c1-55 \
+  | sed 's/-*$//')
+SANITIZED="${SANITIZED:-svc-${SERVICE_ID}}"
+INSTANCE_NAME="np-${SANITIZED}"
+
+# Merge .service.attributes with the action .parameters.
+# CRITICAL: on the first "create" the service attributes are empty or partial —
+# the user's values arrive in .parameters. jq's * merges with the right-hand
+# side winning, so parameters always take precedence.
+SERVICE_ATTRS=$(echo "$CONTEXT" | jq -r '(.service.attributes // {}) * (.parameters // {})')
+
+INSTANCE_CLASS=$(echo "$SERVICE_ATTRS"    | jq -r '.instance_class               // "db.t3.medium"')
+INSTANCE_COUNT=$(echo "$SERVICE_ATTRS"    | jq -r '.instance_count               // 1')
+ENGINE_VERSION=$(echo "$SERVICE_ATTRS"    | jq -r '.engine_version               // "5.0.0"')
+BACKUP_RETENTION=$(echo "$SERVICE_ATTRS"  | jq -r '.backup_retention_period      // 7')
+BACKUP_WINDOW=$(echo "$SERVICE_ATTRS"     | jq -r '.preferred_backup_window      // "03:00-04:00"')
+MAINTENANCE_WINDOW=$(echo "$SERVICE_ATTRS"| jq -r '.preferred_maintenance_window // "Mon:04:00-Mon:05:00"')
+DELETION_PROTECTION=$(echo "$SERVICE_ATTRS" | jq -r '.deletion_protection        // false')
+
+# --- Cluster identifier: compute once, then freeze --------------------------
+# cluster_identifier is ForceNew. If a rename of the service changed it, tofu
+# would destroy the cluster and build a new, empty one — silently, as a normal
+# "update". So once write_service_outputs has recorded it, that value wins over
+# anything recomputed from the current name.
+EXISTING_CLUSTER_ID=$(echo "$CONTEXT" | jq -r '.service.attributes.cluster_identifier // ""')
+if [ -n "$EXISTING_CLUSTER_ID" ] && [ "$EXISTING_CLUSTER_ID" != "null" ]; then
+  INSTANCE_NAME="$EXISTING_CLUSTER_ID"
+  echo "Using existing cluster_identifier from service attributes: ${INSTANCE_NAME}"
+else
+  echo "Computed new cluster_identifier: ${INSTANCE_NAME}"
+fi
+
+# --- Read static config from values.yaml ------------------------------------
+# CRITICAL: $VALUES is a FILE PATH set by "np service workflow exec --values <path>",
+# NOT JSON content. Read individual keys with yaml_value().
+yaml_value() {
+  local key="$1" default="$2" file="$3"
+  local val
+  val=$(grep "^${key}:" "$file" 2>/dev/null | sed 's/^[^:]*: *//;s/^"//;s/"$//' | head -1)
+  echo "${val:-$default}"
+}
+
+AWS_PROFILE_VAL=$(yaml_value "aws_profile" "" "$VALUES")
+
+if [ -n "${AWS_PROFILE_VAL}" ] && [ -z "${AWS_PROFILE:-}" ]; then
+  export AWS_PROFILE="${AWS_PROFILE_VAL}"
+fi
+
+# --- Resolve AWS context from nullplatform providers ------------------------
+# Region and VPC live in runtime_configuration providers scoped to the account.
+# Derive the account NRN from the service NRN by stripping :namespace= onward,
+# then query each provider by its stored_keys.
+
+ACCOUNT_NRN=$(echo "$CONTEXT" | jq -r '.service.nrn // .entity_nrn // ""' | sed 's/:namespace=.*$//')
+
+if [ -z "$ACCOUNT_NRN" ]; then
+  echo "ERROR: could not derive account NRN from .service.nrn in context" >&2
+  exit 1
+fi
+
+NP_PROVIDERS=$(np provider list --nrn "$ACCOUNT_NRN" --format json --limit 100)
+
+echo "Resolving region and VPC for account: ${ACCOUNT_NRN}"
+
+ACCOUNT_PROVIDER_ID=$(echo "$NP_PROVIDERS" \
+  | jq -r '[(.results // [])[] | select((.data_source.stored_keys // []) | contains(["account.region"]))] | first | .id // ""')
+
+if [ -z "$ACCOUNT_PROVIDER_ID" ] || [ "$ACCOUNT_PROVIDER_ID" = "null" ]; then
+  echo "ERROR: no account provider with account.region found for ${ACCOUNT_NRN}" >&2
+  exit 1
+fi
+
+ACCOUNT_PROVIDER_DATA=$(np provider read --id "$ACCOUNT_PROVIDER_ID" --format json)
+REGION=$(echo "$ACCOUNT_PROVIDER_DATA" | jq -r '.attributes.account.region // ""')
+
+if [ -z "$REGION" ]; then
+  echo "ERROR: account.region not found in provider ${ACCOUNT_PROVIDER_ID}" >&2
+  exit 1
+fi
+
+echo "Using region: ${REGION}"
+export REGION
+
+VPC_PROVIDER_ID=$(echo "$NP_PROVIDERS" \
+  | jq -r '[(.results // [])[] | select((.data_source.stored_keys // []) | contains(["vpc.id"]))] | first | .id // ""')
+
+if [ -z "$VPC_PROVIDER_ID" ] || [ "$VPC_PROVIDER_ID" = "null" ]; then
+  echo "ERROR: no VPC provider found for account ${ACCOUNT_NRN}" >&2
+  echo "       DocumentDB is VPC-only — without a VPC there is nowhere to put the cluster." >&2
+  exit 1
+fi
+
+VPC_PROVIDER_DATA=$(np provider read --id "$VPC_PROVIDER_ID" --format json)
+VPC_ID=$(echo "$VPC_PROVIDER_DATA" | jq -r '.attributes.vpc.id // ""')
+
+if [ -z "$VPC_ID" ]; then
+  echo "ERROR: vpc.id not found in provider ${VPC_PROVIDER_ID}" >&2
+  exit 1
+fi
+
+echo "Using VPC: ${VPC_ID}"
+
+# --- Ensure the per-instance tfstate bucket exists --------------------------
+# One bucket per service instance keeps state isolated and the name
+# reconstructable from SERVICE_ID alone. The agent's permissions role needs
+# s3:CreateBucket + s3:PutBucketVersioning on arn:aws:s3:::np-service-*.
+
+TFSTATE_BUCKET="np-service-${SERVICE_ID}"
+
+if ! aws s3api head-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION" 2>/dev/null; then
+  echo "Creating tfstate bucket: ${TFSTATE_BUCKET}"
+  if [ "$REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION"
+  else
+    aws s3api create-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION" \
+      --create-bucket-configuration LocationConstraint="$REGION"
+  fi
+  aws s3api put-bucket-versioning --bucket "$TFSTATE_BUCKET" \
+    --versioning-configuration Status=Enabled
+  echo "Bucket ${TFSTATE_BUCKET} created with versioning enabled."
+else
+  echo "Using existing tfstate bucket: ${TFSTATE_BUCKET}"
+fi
+
+export TFSTATE_BUCKET
+
+# --- Terraform execution variables ------------------------------------------
+
+export OUTPUT_DIR="/tmp/np-service-${SERVICE_ID}"
+mkdir -p "$OUTPUT_DIR"
+
+export TOFU_MODULE_DIR="$SERVICE_PATH/deployment"
+
+export TOFU_INIT_VARIABLES="-backend-config=bucket=${TFSTATE_BUCKET} -backend-config=key=terraform.tfstate -backend-config=region=${REGION} -backend-config=use_lockfile=true"
+
+export TOFU_VARIABLES="-var=service_id=${SERVICE_ID} -var=instance_name=${INSTANCE_NAME} -var=region=${REGION} -var=vpc_id=${VPC_ID} -var=instance_class=${INSTANCE_CLASS} -var=instance_count=${INSTANCE_COUNT} -var=engine_version=${ENGINE_VERSION} -var=backup_retention_period=${BACKUP_RETENTION} -var=preferred_backup_window=${BACKUP_WINDOW} -var=preferred_maintenance_window=${MAINTENANCE_WINDOW} -var=deletion_protection=${DELETION_PROTECTION}"
+
+# --- Link context (link workflows only) -------------------------------------
+# Consumed by build_permissions_context in the next workflow step.
+#
+# NOTE: TOFU_MODULE_DIR is exported above but the link workflows deliberately
+# leave it out of their build-context step's output: block. See the comment in
+# workflows/aws/link.yaml — propagating it would point a later tofu destroy at
+# the deployment module and take the whole cluster with it.
+
+if [ "${ACTION_SOURCE:-}" = "link" ]; then
+  LINK_ID=$(echo "$CONTEXT"   | jq -r '.link.id        // ""')
+  LINK_NAME=$(echo "$CONTEXT" | jq -r '.link.name      // ""')
+  SCOPE_ID=$(echo "$CONTEXT"  | jq -r '.link.scope.id  // ""')
+  SCOPE_NRN=$(echo "$CONTEXT" | jq -r '.link.scope.nrn // ""')
+  export LINK_ID LINK_NAME SCOPE_ID SCOPE_NRN
+
+  LINK_ATTRS=$(echo "$CONTEXT" | jq -r '(.link.attributes // {}) * (.parameters // {})')
+  LINK_ACCESS_LEVEL=$(echo "$LINK_ATTRS" | jq -r '.access_level // "read-write"')
+  LINK_DB_NAME=$(echo "$LINK_ATTRS"      | jq -r '.db_name      // ""')
+  export LINK_ACCESS_LEVEL LINK_DB_NAME
+fi

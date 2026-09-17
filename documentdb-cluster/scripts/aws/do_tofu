@@ -1,0 +1,75 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# do_tofu — Copies the Terraform module into OUTPUT_DIR and runs tofu.
+#
+# Expected environment (from build_context or build_permissions_context):
+#   OUTPUT_DIR          — working directory for this execution
+#   TOFU_MODULE_DIR     — the module to run (deployment/ or permissions/)
+#   TOFU_INIT_VARIABLES — -backend-config= flags for tofu init
+#   TOFU_VARIABLES      — -var= flags for apply/destroy
+#
+# From the workflow YAML's configuration block:
+#   TOFU_ACTION         — "apply" or "destroy"
+# ---------------------------------------------------------------------------
+
+# --- Skip guards ------------------------------------------------------------
+# A previous step may have determined there is nothing to do: an unlink whose
+# link never finished being created, or a delete of a service that never
+# provisioned. Running tofu destroy against an empty state is harmless, but
+# these guards also cover the case where TOFU_MODULE_DIR was never resolved —
+# and they must be checked BEFORE that variable is read, because set -u would
+# otherwise abort with an unbound variable instead of exiting cleanly.
+
+if [ "${LINK_NEVER_CREATED:-false}" = "true" ]; then
+  echo "LINK_NEVER_CREATED=true — nothing was ever provisioned for this link, skipping tofu."
+  exit 0
+fi
+
+if [ "${SETUP_SKIPPED:-false}" = "true" ]; then
+  echo "SETUP_SKIPPED=true — skipping tofu."
+  exit 0
+fi
+
+TOFU_ACTION="${TOFU_ACTION:-apply}"
+
+# ---------------------------------------------------------------------------
+# tofu is baked into the worker image. This fallback only matters when the
+# service runs on an agent that predates the packaged image (the legacy
+# git-clone flow), where nothing guarantees the binary is present.
+# ---------------------------------------------------------------------------
+if ! command -v tofu &>/dev/null; then
+  # 1.10+ is required for native S3 state locking (use_lockfile=true).
+  TOFU_VERSION="1.12.6"
+  TOFU_BIN_DIR="/tmp/np-tofu-bin"
+  TOFU_BIN="$TOFU_BIN_DIR/tofu"
+
+  if [ ! -f "$TOFU_BIN" ]; then
+    echo "tofu not found in PATH, installing v${TOFU_VERSION} to ${TOFU_BIN_DIR}..."
+    mkdir -p "$TOFU_BIN_DIR"
+    curl -fsSL \
+      "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip" \
+      -o /tmp/tofu.zip
+    unzip -qo /tmp/tofu.zip tofu -d "$TOFU_BIN_DIR"
+    chmod +x "$TOFU_BIN"
+    rm -f /tmp/tofu.zip
+    echo "tofu installed: $("$TOFU_BIN" version | head -1)"
+  else
+    echo "Using cached tofu at ${TOFU_BIN}"
+  fi
+
+  export PATH="$TOFU_BIN_DIR:$PATH"
+fi
+
+cd "$OUTPUT_DIR"
+
+cp -r "$TOFU_MODULE_DIR"/* .
+
+echo "Running: tofu init"
+# shellcheck disable=SC2086
+tofu init $TOFU_INIT_VARIABLES
+
+echo "Running: tofu $TOFU_ACTION"
+# shellcheck disable=SC2086
+tofu "$TOFU_ACTION" -auto-approve $TOFU_VARIABLES

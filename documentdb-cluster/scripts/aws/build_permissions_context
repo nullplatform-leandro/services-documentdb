@@ -1,0 +1,103 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# build_permissions_context — Prepares the Terraform execution environment for
+# link actions (link / link-update / unlink). Runs AFTER build_context, which
+# has already set: CONTEXT, VALUES, SERVICE_PATH, REGION, TFSTATE_BUCKET,
+# LINK_ID, LINK_ACCESS_LEVEL, LINK_DB_NAME.
+#
+# It points tofu at the permissions module, which provisions one MongoDB user
+# per link through mongosh.
+# ---------------------------------------------------------------------------
+
+# Shell functions do NOT carry across scripts — each runs in its own process,
+# so this helper is redefined here rather than inherited from build_context.
+yaml_value() {
+  local key="$1" default="$2" file="$3"
+  local val
+  val=$(grep "^${key}:" "$file" 2>/dev/null | sed 's/^[^:]*: *//;s/^"//;s/"$//' | head -1)
+  echo "${val:-$default}"
+}
+
+if [ -z "${REGION:-}" ]; then
+  echo "ERROR: REGION is not set. Expected to be exported by build_context." >&2
+  exit 1
+fi
+
+if [ -z "${TFSTATE_BUCKET:-}" ]; then
+  echo "ERROR: TFSTATE_BUCKET is not set. Expected to be exported by build_context." >&2
+  exit 1
+fi
+
+AWS_PROFILE_VAL=$(yaml_value "aws_profile" "" "$VALUES")
+
+if [ -n "${AWS_PROFILE_VAL}" ] && [ -z "${AWS_PROFILE:-}" ]; then
+  export AWS_PROFILE="${AWS_PROFILE_VAL}"
+fi
+
+# --- Read service outputs (written by write_service_outputs after create) ---
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+ACTION_TYPE=$(echo "$CONTEXT" | jq -r '.type // ""')
+SERVICE_ATTRS=$(echo "$CONTEXT" | jq -r '.service.attributes // {}')
+
+DOCDB_HOST=$(echo "$SERVICE_ATTRS"       | jq -r '.endpoint          // ""')
+DOCDB_PORT=$(echo "$SERVICE_ATTRS"       | jq -r '.port              // 27017')
+MASTER_SECRET_ARN=$(echo "$SERVICE_ATTRS" | jq -r '.master_secret_arn // ""')
+
+# --- Tolerate links that never finished being created ----------------------
+# Unlinking something whose create failed halfway is a normal operation, not an
+# error. Signal do_tofu to skip rather than failing the whole action — an
+# unlink that cannot succeed must still let the platform clean up the entity.
+
+link_never_created() {
+  echo "$1"
+  echo "LINK_NEVER_CREATED=true — skipping tofu."
+  export LINK_NEVER_CREATED=true
+  export OUTPUT_DIR="/tmp/np-link-${LINK_ID:-unknown}"
+  mkdir -p "$OUTPUT_DIR"
+  exit 0
+}
+
+if [ -z "$DOCDB_HOST" ] || [ -z "$MASTER_SECRET_ARN" ]; then
+  if [ "$ACTION_TYPE" = "delete" ]; then
+    link_never_created "WARNING: unlink with no cluster endpoint/secret in service attributes."
+  fi
+  echo "ERROR: endpoint/master_secret_arn not found in service attributes." >&2
+  echo "       Has the cluster been created and write_service_outputs completed?" >&2
+  exit 1
+fi
+
+# --- Database this link is scoped to ---------------------------------------
+# Re-read here rather than trusting build_context alone: on update actions the
+# value lives in .link.attributes, on create it arrives in .parameters.
+
+LINK_ATTRS=$(echo "$CONTEXT" | jq -r '(.link.attributes // {}) * (.parameters // {})')
+DB_NAME=$(echo "$LINK_ATTRS" | jq -r '.db_name // ""')
+DB_NAME="${DB_NAME:-${LINK_DB_NAME:-}}"
+
+if [ -z "$DB_NAME" ]; then
+  if [ "$ACTION_TYPE" = "delete" ]; then
+    link_never_created "WARNING: unlink with no db_name — the link never completed creation."
+  fi
+  echo "ERROR: db_name is required to create a link" >&2
+  exit 1
+fi
+
+# --- Derive the MongoDB username from the link ID --------------------------
+# Deterministic, so the same link always resolves to the same user — which is
+# what makes the destroy path able to find it.
+
+MONGO_USERNAME="np_$(echo "${LINK_ID}" | tr -d '-' | cut -c1-16 | tr '[:upper:]' '[:lower:]')"
+
+# --- Per-link working directory and state ----------------------------------
+
+export OUTPUT_DIR="/tmp/np-link-${LINK_ID}"
+mkdir -p "$OUTPUT_DIR"
+
+export TOFU_MODULE_DIR="$SERVICE_PATH/permissions"
+
+export TOFU_INIT_VARIABLES="-backend-config=bucket=${TFSTATE_BUCKET} -backend-config=key=services/documentdb-cluster/${SERVICE_ID}/links/${LINK_ID}.tfstate -backend-config=region=${REGION} -backend-config=use_lockfile=true"
+
+export TOFU_VARIABLES="-var=link_id=${LINK_ID} -var=region=${REGION} -var=docdb_host=${DOCDB_HOST} -var=docdb_port=${DOCDB_PORT} -var=db_name=${DB_NAME} -var=mongo_username=${MONGO_USERNAME} -var=master_secret_arn=${MASTER_SECRET_ARN} -var=access_level=${LINK_ACCESS_LEVEL:-read-write}"

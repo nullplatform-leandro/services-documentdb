@@ -1,0 +1,58 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# write_service_outputs — Reads the deployment module's Terraform outputs and
+# writes them to the NP service attributes.
+#
+# Attributes marked "export": true in the spec (endpoint, reader_endpoint,
+# port, tls_ca_url) become env vars in linked applications. The rest
+# (cluster_identifier, master_secret_arn, security_group_id) are internal:
+# build_context and build_permissions_context read them back on later actions.
+# ---------------------------------------------------------------------------
+
+cd "$OUTPUT_DIR"
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+
+echo "Reading Terraform outputs for service $SERVICE_ID..."
+
+ENDPOINT=$(tofu output -raw endpoint 2>/dev/null || echo "")
+READER_ENDPOINT=$(tofu output -raw reader_endpoint 2>/dev/null || echo "")
+PORT=$(tofu output -raw port 2>/dev/null || echo "27017")
+CLUSTER_IDENTIFIER=$(tofu output -raw cluster_identifier 2>/dev/null || echo "")
+MASTER_SECRET_ARN=$(tofu output -raw master_secret_arn 2>/dev/null || echo "")
+SECURITY_GROUP_ID=$(tofu output -raw security_group_id 2>/dev/null || echo "")
+TLS_CA_URL=$(tofu output -raw tls_ca_url 2>/dev/null || echo "")
+
+if [ -z "$ENDPOINT" ]; then
+  echo "WARNING: No endpoint output found. Skipping attribute update."
+  exit 0
+fi
+
+ATTRS=$(jq -n \
+  --arg endpoint          "$ENDPOINT" \
+  --arg reader_endpoint   "$READER_ENDPOINT" \
+  --arg port              "$PORT" \
+  --arg cluster_id        "$CLUSTER_IDENTIFIER" \
+  --arg master_secret_arn "$MASTER_SECRET_ARN" \
+  --arg security_group_id "$SECURITY_GROUP_ID" \
+  --arg tls_ca_url        "$TLS_CA_URL" \
+  '{
+    endpoint:           $endpoint,
+    reader_endpoint:    $reader_endpoint,
+    port:               ($port | tonumber),
+    cluster_identifier: $cluster_id,
+    tls_ca_url:         $tls_ca_url
+  }
+  + (if $master_secret_arn != "" then {master_secret_arn: $master_secret_arn} else {} end)
+  + (if $security_group_id != "" then {security_group_id: $security_group_id} else {} end)')
+
+echo "Updating service $SERVICE_ID attributes:"
+echo "  endpoint:           $ENDPOINT"
+echo "  reader_endpoint:    $READER_ENDPOINT"
+echo "  port:               $PORT"
+echo "  cluster_identifier: $CLUSTER_IDENTIFIER"
+
+np service patch --id "$SERVICE_ID" --body "{\"attributes\": $ATTRS}"
+echo "Service attributes updated successfully."

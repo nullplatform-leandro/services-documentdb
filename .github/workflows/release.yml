@@ -1,0 +1,58 @@
+name: release
+
+# Two services live in this repo, and a package maps to exactly one image
+# (NP_PACKAGE_NAME takes a single value), so each release publishes two images
+# from the same context with different Dockerfiles.
+#
+# They are CHAINED rather than run in parallel, and that matters: the reusable
+# workflow is release-please -> build+push -> finalize in a single run. Calling
+# it twice independently would cut two releases for one push. So the first call
+# runs the full pipeline and the second reuses the tag it produced through
+# `existing_tag`, which skips release-please and publishes only the image.
+#
+# Recovery / backfill: dispatch with existing_tag to republish both images for
+# a tag that already exists.
+#
+# Configure: secrets AWS_ROLE_ARN_ECR_PUSH + ARTIFACT_NP_API_KEY, variable
+# NP_ARTIFACT_NRN. Both ECR repositories must exist first — ECR never creates
+# a repository on push.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      existing_tag:
+        description: 'Publish + finalize an existing tag (recovery/backfill)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write   # OIDC auth against AWS for the ECR push
+
+jobs:
+  cluster:
+    uses: nullplatform/actions-nullplatform/.github/workflows/release-publish-oci.yml@v1.4.0
+    with:
+      image_name: services/documentdb-cluster
+      dockerfile: Dockerfile.cluster
+      existing_tag: ${{ inputs.existing_tag || '' }}
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
+      artifact_np_api_key: ${{ secrets.ARTIFACT_NP_API_KEY }}
+
+  database:
+    needs: cluster
+    # Only when the first job actually produced a tag — either by cutting a
+    # release, or because this is a recovery dispatch.
+    if: ${{ needs.cluster.outputs.tag_name != '' }}
+    uses: nullplatform/actions-nullplatform/.github/workflows/release-publish-oci.yml@v1.4.0
+    with:
+      image_name: services/documentdb-database
+      dockerfile: Dockerfile.database
+      existing_tag: ${{ needs.cluster.outputs.tag_name }}
+    secrets:
+      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
+      artifact_np_api_key: ${{ secrets.ARTIFACT_NP_API_KEY }}

@@ -1,0 +1,226 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# build_context — Prepares the Terraform execution environment for service
+# actions on documentdb-database.
+#
+# This service creates no AWS infrastructure. Its whole job is to locate an
+# existing documentdb-cluster service and create one database inside it, so
+# most of this script is resolution rather than configuration.
+#
+# For link actions it also exports the LINK_* variables that
+# build_permissions_context consumes in the next workflow step.
+# ---------------------------------------------------------------------------
+
+# --- Parse service context --------------------------------------------------
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+SERVICE_NRN=$(echo "$CONTEXT" | jq -r '.service.nrn // .entity_nrn // ""')
+
+if [ -z "$SERVICE_NRN" ]; then
+  echo "ERROR: could not read the service NRN from context" >&2
+  exit 1
+fi
+
+ACCOUNT_NRN=$(echo "$SERVICE_NRN" | sed 's/:namespace=.*$//')
+NAMESPACE_NRN=$(echo "$SERVICE_NRN" | sed 's/:application=.*$//')
+
+SERVICE_ATTRS=$(echo "$CONTEXT" | jq -r '(.service.attributes // {}) * (.parameters // {})')
+
+DROP_ON_DELETE=$(echo "$SERVICE_ATTRS" | jq -r '.drop_on_delete // false')
+
+# --- Database name: derive once, then freeze --------------------------------
+# Renaming the service must never repoint it at a different database: that
+# would abandon the data and hand linked applications an empty one, as an
+# ordinary "update".
+
+EXISTING_DB_NAME=$(echo "$CONTEXT" | jq -r '.service.attributes.database_name // ""')
+
+if [ -n "$EXISTING_DB_NAME" ] && [ "$EXISTING_DB_NAME" != "null" ]; then
+  DB_NAME="$EXISTING_DB_NAME"
+  echo "Using existing database_name from service attributes: ${DB_NAME}"
+else
+  DB_NAME=$(echo "$SERVICE_ATTRS" | jq -r '.db_name // ""')
+  if [ -z "$DB_NAME" ] || [ "$DB_NAME" = "null" ]; then
+    # Default: one database per application. The application ID is stable and
+    # unique, which the application's name is not.
+    APPLICATION_ID=$(echo "$SERVICE_NRN" | sed -n 's/.*:application=\([^:]*\).*/\1/p')
+    if [ -z "$APPLICATION_ID" ]; then
+      APPLICATION_ID="$SERVICE_ID"
+    fi
+    DB_NAME="app_$(echo "$APPLICATION_ID" | tr -cs '[:alnum:]' '_' | sed 's/_*$//')"
+  fi
+  echo "Computed database_name: ${DB_NAME}"
+fi
+
+# --- Read static config from values.yaml ------------------------------------
+# CRITICAL: $VALUES is a FILE PATH set by "np service workflow exec --values <path>",
+# NOT JSON content.
+yaml_value() {
+  local key="$1" default="$2" file="$3"
+  local val
+  val=$(grep "^${key}:" "$file" 2>/dev/null | sed 's/^[^:]*: *//;s/^"//;s/"$//' | head -1)
+  echo "${val:-$default}"
+}
+
+AWS_PROFILE_VAL=$(yaml_value "aws_profile" "" "$VALUES")
+
+if [ -n "${AWS_PROFILE_VAL}" ] && [ -z "${AWS_PROFILE:-}" ]; then
+  export AWS_PROFILE="${AWS_PROFILE_VAL}"
+fi
+
+# --- Resolve the AWS region -------------------------------------------------
+# Needed to read the hosting cluster's master secret and to hold tfstate. This
+# service never creates AWS resources, but it does talk to two AWS services.
+
+NP_PROVIDERS=$(np provider list --nrn "$ACCOUNT_NRN" --format json --limit 100)
+
+ACCOUNT_PROVIDER_ID=$(echo "$NP_PROVIDERS" \
+  | jq -r '[(.results // [])[] | select((.data_source.stored_keys // []) | contains(["account.region"]))] | first | .id // ""')
+
+if [ -z "$ACCOUNT_PROVIDER_ID" ] || [ "$ACCOUNT_PROVIDER_ID" = "null" ]; then
+  echo "ERROR: no account provider with account.region found for ${ACCOUNT_NRN}" >&2
+  exit 1
+fi
+
+REGION=$(np provider read --id "$ACCOUNT_PROVIDER_ID" --format json | jq -r '.attributes.account.region // ""')
+
+if [ -z "$REGION" ]; then
+  echo "ERROR: account.region not found in provider ${ACCOUNT_PROVIDER_ID}" >&2
+  exit 1
+fi
+
+echo "Using region: ${REGION}"
+export REGION
+
+# --- Resolve the hosting cluster --------------------------------------------
+# Three sources, in descending order of trust:
+#   1. resolved_cluster_service_id — recorded on the first successful create.
+#      Once a database lives in a cluster, that binding is permanent: letting
+#      auto-discovery run again on every action would silently repoint the
+#      service the moment a second cluster appeared in the namespace.
+#   2. cluster_service_id — an explicit pin the developer set on the service.
+#   3. Auto-discovery across the namespace, which must find exactly one.
+
+RESOLVED_CLUSTER_ID=$(echo "$CONTEXT" | jq -r '.service.attributes.resolved_cluster_service_id // ""')
+PINNED_CLUSTER_ID=$(echo "$SERVICE_ATTRS" | jq -r '.cluster_service_id // ""')
+
+CLUSTER_SERVICE_ID=""
+
+if [ -n "$RESOLVED_CLUSTER_ID" ] && [ "$RESOLVED_CLUSTER_ID" != "null" ]; then
+  CLUSTER_SERVICE_ID="$RESOLVED_CLUSTER_ID"
+  echo "Using the cluster this database was created in: ${CLUSTER_SERVICE_ID}"
+elif [ -n "$PINNED_CLUSTER_ID" ] && [ "$PINNED_CLUSTER_ID" != "null" ]; then
+  CLUSTER_SERVICE_ID="$PINNED_CLUSTER_ID"
+  echo "Using the pinned cluster_service_id: ${CLUSTER_SERVICE_ID}"
+else
+  echo "Auto-discovering a documentdb-cluster service in ${NAMESPACE_NRN}..."
+
+  CLUSTER_SPEC_ID=$(np service specification list --nrn "$ACCOUNT_NRN" --type dependency --all --format json 2>/dev/null \
+    | jq -r '[(.results // [])[] | select(.slug == "documentdb-cluster")] | first | .id // ""')
+
+  if [ -z "$CLUSTER_SPEC_ID" ] || [ "$CLUSTER_SPEC_ID" = "null" ]; then
+    echo "ERROR: no service specification with slug 'documentdb-cluster' is registered under ${ACCOUNT_NRN}." >&2
+    echo "       documentdb-database provisions nothing on its own — it needs a cluster to live in." >&2
+    exit 1
+  fi
+
+  CANDIDATES=$(np service list \
+    --nrn "$NAMESPACE_NRN" \
+    --specification-id "$CLUSTER_SPEC_ID" \
+    --status active \
+    --all --format json 2>/dev/null \
+    | jq -c '[(.results // [])[] | select((.attributes.endpoint // "") != "" and (.attributes.master_secret_arn // "") != "")]')
+
+  CANDIDATE_COUNT=$(echo "$CANDIDATES" | jq 'length')
+
+  if [ "$CANDIDATE_COUNT" -eq 0 ]; then
+    echo "ERROR: no active documentdb-cluster service found in ${NAMESPACE_NRN}." >&2
+    echo "       Create one first, or set cluster_service_id on this service." >&2
+    exit 1
+  fi
+
+  if [ "$CANDIDATE_COUNT" -gt 1 ]; then
+    echo "ERROR: ${CANDIDATE_COUNT} documentdb-cluster services are active in ${NAMESPACE_NRN}:" >&2
+    echo "$CANDIDATES" | jq -r '.[] | "         \(.id)  \(.name // "(unnamed)")"' >&2
+    echo "       Auto-discovery only resolves when there is exactly one. Set" >&2
+    echo "       cluster_service_id on this service to choose deliberately." >&2
+    exit 1
+  fi
+
+  CLUSTER_SERVICE_ID=$(echo "$CANDIDATES" | jq -r '.[0].id')
+  echo "Discovered cluster service: ${CLUSTER_SERVICE_ID}"
+fi
+
+# --- Read the cluster's connection details ----------------------------------
+
+CLUSTER_SERVICE=$(np service read --id "$CLUSTER_SERVICE_ID" --format json)
+CLUSTER_ATTRS=$(echo "$CLUSTER_SERVICE" | jq -r '.attributes // {}')
+
+DOCDB_HOST=$(echo "$CLUSTER_ATTRS"        | jq -r '.endpoint          // ""')
+DOCDB_READER=$(echo "$CLUSTER_ATTRS"      | jq -r '.reader_endpoint   // ""')
+DOCDB_PORT=$(echo "$CLUSTER_ATTRS"        | jq -r '.port              // 27017')
+MASTER_SECRET_ARN=$(echo "$CLUSTER_ATTRS" | jq -r '.master_secret_arn // ""')
+CLUSTER_IDENTIFIER=$(echo "$CLUSTER_ATTRS" | jq -r '.cluster_identifier // ""')
+TLS_CA_URL=$(echo "$CLUSTER_ATTRS"        | jq -r '.tls_ca_url        // "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"')
+
+if [ -z "$DOCDB_HOST" ] || [ -z "$MASTER_SECRET_ARN" ]; then
+  echo "ERROR: cluster service ${CLUSTER_SERVICE_ID} has no endpoint/master_secret_arn." >&2
+  echo "       It is probably still creating, or its create action failed." >&2
+  exit 1
+fi
+
+echo "Hosting cluster: ${DOCDB_HOST}:${DOCDB_PORT} (${CLUSTER_IDENTIFIER})"
+
+# Carried to write_service_outputs, which records them on this service so links
+# and later actions never have to resolve the cluster again.
+export CLUSTER_SERVICE_ID DOCDB_HOST DOCDB_READER DOCDB_PORT MASTER_SECRET_ARN CLUSTER_IDENTIFIER TLS_CA_URL DB_NAME
+
+# --- Ensure the per-instance tfstate bucket exists --------------------------
+
+TFSTATE_BUCKET="np-service-${SERVICE_ID}"
+
+if ! aws s3api head-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION" 2>/dev/null; then
+  echo "Creating tfstate bucket: ${TFSTATE_BUCKET}"
+  if [ "$REGION" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION"
+  else
+    aws s3api create-bucket --bucket "$TFSTATE_BUCKET" --region "$REGION" \
+      --create-bucket-configuration LocationConstraint="$REGION"
+  fi
+  aws s3api put-bucket-versioning --bucket "$TFSTATE_BUCKET" \
+    --versioning-configuration Status=Enabled
+  echo "Bucket ${TFSTATE_BUCKET} created with versioning enabled."
+else
+  echo "Using existing tfstate bucket: ${TFSTATE_BUCKET}"
+fi
+
+export TFSTATE_BUCKET
+
+# --- Terraform execution variables ------------------------------------------
+
+export OUTPUT_DIR="/tmp/np-service-${SERVICE_ID}"
+mkdir -p "$OUTPUT_DIR"
+
+export TOFU_MODULE_DIR="$SERVICE_PATH/db_setup"
+
+export TOFU_INIT_VARIABLES="-backend-config=bucket=${TFSTATE_BUCKET} -backend-config=key=terraform.tfstate -backend-config=region=${REGION} -backend-config=use_lockfile=true"
+
+export TOFU_VARIABLES="-var=service_id=${SERVICE_ID} -var=region=${REGION} -var=docdb_host=${DOCDB_HOST} -var=docdb_port=${DOCDB_PORT} -var=db_name=${DB_NAME} -var=master_secret_arn=${MASTER_SECRET_ARN} -var=drop_on_delete=${DROP_ON_DELETE}"
+
+# --- Link context (link workflows only) -------------------------------------
+# See the comment at the top of workflows/aws/link.yaml: TOFU_MODULE_DIR is
+# exported above but deliberately NOT declared in the link workflows' output.
+
+if [ "${ACTION_SOURCE:-}" = "link" ]; then
+  LINK_ID=$(echo "$CONTEXT"   | jq -r '.link.id        // ""')
+  LINK_NAME=$(echo "$CONTEXT" | jq -r '.link.name      // ""')
+  SCOPE_ID=$(echo "$CONTEXT"  | jq -r '.link.scope.id  // ""')
+  SCOPE_NRN=$(echo "$CONTEXT" | jq -r '.link.scope.nrn // ""')
+  export LINK_ID LINK_NAME SCOPE_ID SCOPE_NRN
+
+  LINK_ATTRS=$(echo "$CONTEXT" | jq -r '(.link.attributes // {}) * (.parameters // {})')
+  LINK_ACCESS_LEVEL=$(echo "$LINK_ATTRS" | jq -r '.access_level // "read-write"')
+  export LINK_ACCESS_LEVEL
+fi

@@ -1,0 +1,80 @@
+# A step's `output:` block is the propagation boundary — not what the script
+# exports. build_context DOES export TOFU_MODULE_DIR (pointing at db_setup/),
+# and it is deliberately NOT declared here.
+#
+# Declaring it would let the db_setup module leak into the link path: if
+# build_permissions_context exited early, the tofu step below would inherit
+# TOFU_MODULE_DIR=db_setup and a `destroy` would run the database teardown
+# instead of dropping one user — on an unlink.
+#
+# Left undeclared, do_tofu dies loudly on an unbound variable under `set -u`.
+# That is the intended failure mode. Do not add TOFU_MODULE_DIR here.
+steps:
+  - name: assume role
+    type: script
+    file: $SERVICE_PATH/utils/assume_role_step
+    output:
+      - name: AWS_ACCESS_KEY_ID
+        type: environment
+      - name: AWS_SECRET_ACCESS_KEY
+        type: environment
+      - name: AWS_SESSION_TOKEN
+        type: environment
+
+  - name: build context
+    type: script
+    file: $SERVICE_PATH/scripts/aws/build_context
+    output:
+      - name: OUTPUT_DIR
+        type: environment
+      - name: REGION
+        type: environment
+      - name: TFSTATE_BUCKET
+        type: environment
+      - name: LINK_ID
+        type: environment
+      - name: LINK_NAME
+        type: environment
+      - name: SCOPE_ID
+        type: environment
+      - name: SCOPE_NRN
+        type: environment
+      - name: LINK_ACCESS_LEVEL
+        type: environment
+      - name: DB_NAME
+        type: environment
+      - name: DOCDB_HOST
+        type: environment
+      - name: DOCDB_READER
+        type: environment
+      - name: DOCDB_PORT
+        type: environment
+      - name: MASTER_SECRET_ARN
+        type: environment
+      - name: CLUSTER_SERVICE_ID
+        type: environment
+      - name: CLUSTER_IDENTIFIER
+        type: environment
+      - name: TLS_CA_URL
+        type: environment
+
+  - name: build permissions context
+    type: script
+    file: $SERVICE_PATH/scripts/aws/build_permissions_context
+    output:
+      - name: OUTPUT_DIR
+        type: environment
+      - name: TOFU_MODULE_DIR
+        type: environment
+      - name: TOFU_INIT_VARIABLES
+        type: environment
+      - name: TOFU_VARIABLES
+        type: environment
+      - name: LINK_NEVER_CREATED
+        type: environment
+
+  - name: tofu
+    type: script
+    file: $SERVICE_PATH/scripts/aws/do_tofu
+    configuration:
+      TOFU_ACTION: destroy

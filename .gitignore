@@ -1,0 +1,27 @@
+# Terraform / OpenTofu
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Variable files are never committed. *.auto.tfvars in particular: tofu loads
+# them automatically and silently, so a stray one is a credential leak that
+# also changes behaviour without appearing in any command line.
+*.tfvars
+*.auto.tfvars
+!terraform.tfvars.example
+
+# Local test scratch
+.env
+*.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

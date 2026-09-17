@@ -1,0 +1,14 @@
+.git
+.github
+.gitignore
+.dockerignore
+.trivyignore
+Dockerfile*
+README.md
+CHANGELOG.md
+# Never bake local terraform state or provider binaries into the image.
+**/.terraform
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/*.auto.tfvars

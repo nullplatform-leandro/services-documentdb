@@ -1,0 +1,21 @@
+# AWS DocumentDB Database Service — Static Configuration
+#
+# These values are not exposed in the nullplatform UI. They configure the
+# execution environment of the agent (or worker) running this service.
+#
+# NOTE: in scripts, $VALUES is a FILE PATH, set by
+#       "np service workflow exec --values <path>". It is NOT JSON content.
+#       Read individual keys with yaml_value(), as build_context does.
+
+# Named AWS profile for local testing (e.g. an SSO profile with DocumentDB,
+# EC2, Secrets Manager and S3 access). If set, and AWS_PROFILE is not already
+# in the environment, build_context exports it so Terraform and the AWS CLI
+# use the right credentials.
+# Run "aws sso login --profile <name>" before starting np-agent locally.
+aws_profile: ""
+
+# Provider categories the platform must resolve into CONTEXT.providers before
+# running workflow steps. identity-access-control is required by
+# utils/assume_role_step to look up the AssumeRole target ARN.
+provider_categories:
+  - identity-access-control

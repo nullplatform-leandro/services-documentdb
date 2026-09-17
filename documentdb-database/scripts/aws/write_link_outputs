@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# write_link_outputs — Reads the permissions module's Terraform outputs and
+# writes them to the NP link attributes.
+#
+# "export": true fields (username) become plain env vars.
+# "export": {secret: true} fields (password, connection_string) are stored
+# encrypted — they read back as null through the API, which is expected — and
+# injected into the application at runtime.
+#
+# database_name is NOT written here even though the permissions module outputs
+# it: on this service the database is a service-level attribute, already
+# exported. Writing it on the link too would inject the same env var twice.
+# ---------------------------------------------------------------------------
+
+if [ "${LINK_NEVER_CREATED:-false}" = "true" ]; then
+  echo "LINK_NEVER_CREATED=true — no outputs to write."
+  exit 0
+fi
+
+cd "$OUTPUT_DIR"
+
+LINK_ID_VAL=$(echo "$CONTEXT" | jq -r '.link.id')
+
+echo "Reading Terraform outputs for link $LINK_ID_VAL..."
+
+USERNAME=$(tofu output -raw username 2>/dev/null || echo "")
+PASSWORD=$(tofu output -raw password 2>/dev/null || echo "")
+CONNECTION_STRING=$(tofu output -raw connection_string 2>/dev/null || echo "")
+
+if [ -z "$USERNAME" ]; then
+  echo "WARNING: No username output found. Skipping link attribute update."
+  exit 0
+fi
+
+ATTRS=$(jq -n \
+  --arg username          "$USERNAME" \
+  --arg password          "$PASSWORD" \
+  --arg connection_string "$CONNECTION_STRING" \
+  '{
+    username:          $username,
+    password:          $password,
+    connection_string: $connection_string
+  }')
+
+echo "Updating link $LINK_ID_VAL attributes:"
+echo "  username:          $USERNAME"
+echo "  password:          ****"
+echo "  connection_string: ****"
+
+np link patch --id "$LINK_ID_VAL" --body "{\"attributes\": $ATTRS}"
+echo "Link attributes updated successfully."

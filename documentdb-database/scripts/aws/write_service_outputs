@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# write_service_outputs — Records what this service resolved and created.
+#
+# Unlike the cluster service, most of what is written here does not come from
+# Terraform: the connection details belong to the hosting cluster and were
+# resolved by build_context. Recording them on this service is what makes
+# resolved_cluster_service_id permanent, so auto-discovery runs exactly once —
+# on the first create — and every later action reads the binding back instead
+# of re-deriving it.
+# ---------------------------------------------------------------------------
+
+cd "$OUTPUT_DIR"
+
+SERVICE_ID=$(echo "$CONTEXT" | jq -r '.service.id')
+
+DATABASE_NAME=$(tofu output -raw database_name 2>/dev/null || echo "${DB_NAME:-}")
+
+if [ -z "$DATABASE_NAME" ]; then
+  echo "WARNING: no database_name available. Skipping attribute update."
+  exit 0
+fi
+
+ATTRS=$(jq -n \
+  --arg database_name    "$DATABASE_NAME" \
+  --arg endpoint         "${DOCDB_HOST:-}" \
+  --arg reader_endpoint  "${DOCDB_READER:-}" \
+  --arg port             "${DOCDB_PORT:-27017}" \
+  --arg tls_ca_url       "${TLS_CA_URL:-}" \
+  --arg cluster_svc_id   "${CLUSTER_SERVICE_ID:-}" \
+  --arg cluster_id       "${CLUSTER_IDENTIFIER:-}" \
+  --arg master_secret    "${MASTER_SECRET_ARN:-}" \
+  '{
+    database_name:   $database_name,
+    endpoint:        $endpoint,
+    reader_endpoint: $reader_endpoint,
+    port:            ($port | tonumber),
+    tls_ca_url:      $tls_ca_url
+  }
+  + (if $cluster_svc_id != "" then {resolved_cluster_service_id: $cluster_svc_id} else {} end)
+  + (if $cluster_id     != "" then {cluster_identifier: $cluster_id} else {} end)
+  + (if $master_secret  != "" then {master_secret_arn: $master_secret} else {} end)')
+
+echo "Updating service $SERVICE_ID attributes:"
+echo "  database_name:               $DATABASE_NAME"
+echo "  endpoint:                    ${DOCDB_HOST:-}"
+echo "  resolved_cluster_service_id: ${CLUSTER_SERVICE_ID:-}"
+
+np service patch --id "$SERVICE_ID" --body "{\"attributes\": $ATTRS}"
+echo "Service attributes updated successfully."
