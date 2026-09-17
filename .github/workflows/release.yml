@@ -97,9 +97,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          # Multi-arch matters: the worker runs on whatever the agent's nodes
-          # are, which is usually amd64 even when you build on an arm64 laptop.
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ inputs.existing_tag || needs.release.outputs.tag_name }}
           cache-from: type=gha
