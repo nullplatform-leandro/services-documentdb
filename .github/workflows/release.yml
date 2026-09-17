@@ -1,21 +1,24 @@
 name: release
 
-# Two services live in this repo, and a package maps to exactly one image
-# (NP_PACKAGE_NAME takes a single value), so each release publishes two images
-# from the same context with different Dockerfiles.
+# Release pipeline for a PRIVATE ECR.
 #
-# They are CHAINED rather than run in parallel, and that matters: the reusable
-# workflow is release-please -> build+push -> finalize in a single run. Calling
-# it twice independently would cut two releases for one push. So the first call
-# runs the full pipeline and the second reuses the tag it produced through
-# `existing_tag`, which skips release-please and publishes only the image.
+# WHY THIS IS NOT nullplatform/actions-nullplatform/release-publish-oci.yml
+# That reusable workflow logs in with `registry-type: public`, hardcoded in
+# every version including main. It can only push to ECR Public. Since these
+# images go to a private ECR, the pipeline is reproduced here instead — same
+# shape, same chaining, different login.
 #
-# Recovery / backfill: dispatch with existing_tag to republish both images for
-# a tag that already exists.
+# Chained in ONE run on purpose: release-please creates tags with GITHUB_TOKEN,
+# and GitHub never triggers workflows from bot-token events, so a separate
+# `on: push: tags` publish workflow silently does not fire.
 #
-# Configure: secrets AWS_ROLE_ARN_ECR_PUSH + ARTIFACT_NP_API_KEY, variable
-# NP_ARTIFACT_NRN. Both ECR repositories must exist first — ECR never creates
-# a repository on push.
+# Recovery / backfill: dispatch with existing_tag to rebuild and republish a tag
+# that already exists.
+#
+# Configure: secret AWS_ROLE_ARN_ECR_PUSH (a role trusting this repo through the
+# GitHub OIDC provider, with ecr:* on the two repositories). No nullplatform key
+# is needed here — the artifact is registered by terraform, from the `package`
+# block's meta, not from CI.
 on:
   push:
     branches:
@@ -23,36 +26,121 @@ on:
   workflow_dispatch:
     inputs:
       existing_tag:
-        description: 'Publish + finalize an existing tag (recovery/backfill)'
+        description: 'Rebuild + republish an existing tag (recovery/backfill)'
         required: true
         type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write   # OIDC auth against AWS for the ECR push
+  contents: write       # release-please cuts releases; the summary edits one
+  pull-requests: write  # release-please opens the release PR
+  id-token: write       # OIDC against AWS, so no static keys live in GitHub
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 235494813897.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
-  cluster:
-    uses: nullplatform/actions-nullplatform/.github/workflows/release-publish-oci.yml@v1.4.0
-    with:
-      image_name: services/documentdb-cluster
-      dockerfile: Dockerfile.cluster
-      existing_tag: ${{ inputs.existing_tag || '' }}
-    secrets:
-      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
-      artifact_np_api_key: ${{ secrets.ARTIFACT_NP_API_KEY }}
+  release:
+    name: Release Please
+    if: ${{ inputs.existing_tag == '' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          release-type: simple
 
-  database:
-    needs: cluster
-    # Only when the first job actually produced a tag — either by cutting a
-    # release, or because this is a recovery dispatch.
-    if: ${{ needs.cluster.outputs.tag_name != '' }}
-    uses: nullplatform/actions-nullplatform/.github/workflows/release-publish-oci.yml@v1.4.0
-    with:
-      image_name: services/documentdb-database
-      dockerfile: Dockerfile.database
-      existing_tag: ${{ needs.cluster.outputs.tag_name }}
-    secrets:
-      aws_role_arn: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
-      artifact_np_api_key: ${{ secrets.ARTIFACT_NP_API_KEY }}
+  publish:
+    name: Build and push
+    needs: release
+    if: ${{ !cancelled() && (needs.release.outputs.release_created == 'true' || inputs.existing_tag != '') }}
+    runs-on: ubuntu-24.04
+    strategy:
+      # One at a time. Both jobs push to the same registry and the summary job
+      # reads both digests afterwards; serialising keeps the logs readable and
+      # costs little, since the two builds share every cached layer.
+      max-parallel: 1
+      matrix:
+        include:
+          - service: documentdb-cluster
+            dockerfile: Dockerfile.cluster
+            repository: service-documentdb-cluster
+          - service: documentdb-database
+            dockerfile: Dockerfile.database
+            repository: service-documentdb-database
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          # Build the commit the tag points at, not whatever main happens to be.
+          ref: ${{ inputs.existing_tag || needs.release.outputs.tag_name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        # No registry-type: the default is private. This single line is the
+        # whole reason this file exists instead of a call to the shared workflow.
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Multi-arch matters: the worker runs on whatever the agent's nodes
+          # are, which is usually amd64 even when you build on an arm64 laptop.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ inputs.existing_tag || needs.release.outputs.tag_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  summary:
+    name: Publish digests to the release
+    needs: [release, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_ECR_PUSH }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Read the digests back from ECR rather than passing them out of the
+      # matrix: a matrix job has one set of outputs shared by every leg, so the
+      # second would overwrite the first.
+      - name: Collect digests and append them to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.existing_tag || needs.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          BLOCK=$'\n\n## Images\n\n| Service | Image | Digest |\n|---|---|---|\n'
+          for pair in "documentdb-cluster:service-documentdb-cluster" \
+                      "documentdb-database:service-documentdb-database"; do
+            svc="${pair%%:*}"; repo="${pair##*:}"
+            digest=$(aws ecr describe-images \
+              --repository-name "$repo" \
+              --image-ids "imageTag=${TAG}" \
+              --query 'imageDetails[0].imageDigest' --output text)
+            echo "${svc} -> ${digest}"
+            BLOCK+="| \`${svc}\` | \`${ECR_REGISTRY}/${repo}\` | \`${digest}\` |"$'\n'
+          done
+          BLOCK+=$'\nPaste these into `cluster_image_digest` and `database_image_digest`.\n'
+
+          # Append rather than replace, so the release keeps its changelog.
+          gh release view "$TAG" --json body --jq .body > /tmp/body.md
+          printf '%s' "$BLOCK" >> /tmp/body.md
+          gh release edit "$TAG" --notes-file /tmp/body.md
+          cat /tmp/body.md >> "$GITHUB_STEP_SUMMARY"

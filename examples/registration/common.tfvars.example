@@ -12,9 +12,15 @@ nrn = "organization=<org-id>:account=<account-id>"
 # Must be a TAG of this repository, not a branch — the module rejects branches.
 service_repository_ref = "v0.1.0"
 
-# While the repository is private the module cannot fetch the specs without a
+# The repository is private, so the module cannot fetch the specs without a
 # fine-grained token carrying Contents: Read-only. Pass it by environment
-# instead of writing it here: export TF_VAR_service_repository_token="<token>"
+# rather than writing it here:
+#   export TF_VAR_service_repository_token="<token>"
+
+# The registry and repository names default to the private ECR the release
+# workflow pushes to (235494813897.dkr.ecr.us-east-1.amazonaws.com,
+# service-documentdb-cluster / service-documentdb-database). Override
+# image_registry / *_image_repository only if you move them.
 
 # Digests from the release, as sha256:<64 hex>.
 cluster_image_digest  = "sha256:..."
