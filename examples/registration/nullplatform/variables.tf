@@ -30,25 +30,25 @@ variable "service_repository_token" {
   type        = string
   sensitive   = true
   default     = null
-  description = "Fine-grained GitHub token with Contents: Read-only. REQUIRED while this repository is private: the module fetches the specs over HTTPS on every apply, so a private repo without a token fails at plan time, not at runtime. Leave null once the repository is public."
+  description = "Fine-grained GitHub token with Contents: Read-only. REQUIRED while this repository is private: the module fetches the specs over HTTPS on every apply, so a private repo without a token fails at plan time, not at runtime. Pass it through TF_VAR_service_repository_token."
 }
 
 variable "image_registry" {
   type        = string
-  default     = "public.ecr.aws"
-  description = "Registry host holding the worker images"
+  default     = "235494813897.dkr.ecr.us-east-1.amazonaws.com"
+  description = "Registry holding the worker images. Private, so two things follow: it must appear in the agent's worker.allowedRegistries (whose default covers only public.ecr.aws/nullplatform/*), and whatever runs the worker pods needs pull permission on it."
 }
 
 variable "cluster_image_repository" {
   type        = string
-  default     = "nullplatform/services/documentdb-cluster"
-  description = "Repository path of the documentdb-cluster worker image"
+  default     = "service-documentdb-cluster"
+  description = "Repository name of the documentdb-cluster worker image. Must match the matrix entry in .github/workflows/release.yml exactly."
 }
 
 variable "database_image_repository" {
   type        = string
-  default     = "nullplatform/services/documentdb-database"
-  description = "Repository path of the documentdb-database worker image"
+  default     = "service-documentdb-database"
+  description = "Repository name of the documentdb-database worker image. Must match the matrix entry in .github/workflows/release.yml exactly."
 }
 
 variable "cluster_image_digest" {

@@ -126,28 +126,38 @@ Four things are needed and none are automatic:
 
 ## Releasing
 
-CI does all of it. `.github/workflows/release.yml` cuts a release with
-release-please, builds and pushes both images to ECR Public, and registers each
-as a nullplatform `oci_image` artifact.
+`.github/workflows/release.yml` cuts a release with release-please, builds both
+images multi-arch, pushes them to the private ECR at `235494813897.dkr.ecr.us-east-1.amazonaws.com`,
+and writes the two digests into the release body.
 
-Two services means two images (`NP_PACKAGE_NAME` takes a single value), and the
-two jobs are **chained, not parallel**: the reusable workflow is
-release-please → build → finalize in one run, so calling it twice independently
-would cut two releases for one push. The second job reuses the first job's
-`tag_name` through `existing_tag`.
+It is a **local workflow, not the shared
+`actions-nullplatform/release-publish-oci.yml`**. That one logs in with
+`registry-type: public` — hardcoded in every version, including `main` — so it
+can only reach ECR Public. A private registry needs its own login, which is the
+single line this file exists for. The rest deliberately mirrors the shared
+pipeline: one chained run, because release-please tags with `GITHUB_TOKEN` and
+GitHub never triggers workflows from bot-token events.
 
-Configure once, or the workflow fails at the push step:
+Configure one secret:
 
 | Kind | Name | What it is |
 |---|---|---|
-| secret | `AWS_ROLE_ARN_ECR_PUSH` | Role assumed via OIDC to push to ECR |
-| secret | `ARTIFACT_NP_API_KEY` | Dedicated key for artifact registration |
-| variable | `NP_ARTIFACT_NRN` | Owner NRN of the registered artifact |
+| secret | `AWS_ROLE_ARN_ECR_PUSH` | Role assumed via OIDC, with `ecr:*` on the two repositories |
 
-Both ECR repositories must already exist. ECR never creates one on push — and
-the two failure messages differ: a 403 means the role's policy does not cover
-that repository, while "repository does not exist" means the name is wrong or
-the repository is genuinely absent.
+Nothing else. The artifact is registered by **terraform**, from the `package`
+block's `meta`, so no nullplatform key and no artifact NRN are needed in CI.
+
+The role needs a trust policy for this repository through the account's GitHub
+OIDC provider — the permission policy alone is not enough, and a missing trust
+policy fails at the very first step with
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`, before ECR is ever
+touched.
+
+Both ECR repositories must already exist — `service-documentdb-cluster` and
+`service-documentdb-database`. ECR never creates one on push, and the two
+failure messages differ: a 403 means the role's policy does not cover that
+repository, while "repository does not exist" means the name is wrong or the
+repository is genuinely absent.
 
 ### Building locally
 
@@ -158,9 +168,9 @@ docker build -f Dockerfile.cluster -t documentdb-cluster:dev .
 ```
 
 Without buildx, `TARGETARCH` is not populated and the tofu download 404s. Pass
-it explicitly: `--build-arg TARGETARCH=arm64`.
-
----
+it explicitly: `--build-arg TARGETARCH=arm64`. A local build is for inspection
+only: it produces a single-architecture image, and the agent's nodes are usually
+amd64. CI builds both architectures.
 
 ## Registering
 
@@ -197,14 +207,20 @@ agent's environment:
 worker_orchestrated_packages = ["containers", "documentdb-cluster", "documentdb-database"]
 ```
 
-`allowedRegistries` only needs touching if the images live somewhere other than
-`public.ecr.aws/nullplatform/*`, which the agent module already allows by
-default. Entries set here are **concatenated** with that default, not a
-replacement, so add only your own:
+`allowedRegistries` needs setting. The agent module defaults to
+`["public.ecr.aws/nullplatform/*"]`, which does not cover this private ECR.
+Entries set here are **concatenated** with that default rather than replacing
+it, so add only this one:
 
 ```hcl
-worker = { allowedRegistries = ["123456789012.dkr.ecr.us-east-1.amazonaws.com/*"] }
+worker = { allowedRegistries = ["235494813897.dkr.ecr.us-east-1.amazonaws.com/*"] }
 ```
+
+A private registry also needs the worker pods to be able to *pull* from it:
+`ecr:GetAuthorizationToken` and `ecr:BatchGetImage` on the node role, IRSA or an
+imagePullSecret, depending on the cluster. Without it the pod sits in
+`ImagePullBackOff` and the service action dies on a timeout that says nothing
+about permissions.
 
 ---
 
