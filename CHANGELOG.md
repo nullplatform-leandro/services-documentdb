@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/nullplatform-leandro/services-documentdb/compare/v0.1.0...v0.1.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* using only amd64 for building docker images in platforms input ([e9ecefd](https://github.com/nullplatform-leandro/services-documentdb/commit/e9ecefdbc381204ccd3a919c80a3b52739fb1587))
+
 ## 0.1.0 (2026-09-17)
 
 
